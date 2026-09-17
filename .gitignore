@@ -1,6 +1,12 @@
 __pycache__/
 *.pyc
 data/*.db
+# the demo DB ships with the repo: deploy targets have a read-only filesystem
+# and cannot run the seeder, so the built database must be committed.
+!data/vendor_intelligence.db
+# transient SQLite journal files — never commit
+data/*.db-wal
+data/*.db-shm
 data/models/
 .pytest_cache/
 .venv/
