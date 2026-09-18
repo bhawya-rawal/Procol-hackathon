@@ -41,6 +41,11 @@ TOOL_SPECS = [
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "my_buyers", "description": "Buyers this vendor is mapped to, mapping status, vendor code, and each buyer's feedback policy.",
      "input_schema": {"type": "object", "properties": {}}},
+    {"name": "demand_by_month", "description": "Month-by-month buying activity per product category over the last N months, built from the events THIS vendor was invited to. Answers 'when do my buyers buy', seasonality, and what to stock. Not total market demand.",
+     "input_schema": {"type": "object", "properties": {
+         "category": {"type": "string"}, "months": {"type": "integer", "description": "How many months back, 3-36. Default 12."}}}},
+    {"name": "bid_revision_behaviour", "description": "First bid vs final bid per event for this vendor: how much they moved, how many revisions they made, and their win rate at 0 / 1 / 2+ revisions. Answers 'does revising help me', 'do I quote once and leave'.",
+     "input_schema": {"type": "object", "properties": {"limit": {"type": "integer", "description": "How many recent events to list. Default 15."}}}},
 ]
 
 
@@ -226,10 +231,145 @@ def _my_buyers(self: "VendorTools") -> dict:
         WHERE m.dealing_with_company_id=? ORDER BY invites DESC""", (self.v,))}
 
 
+def _demand_by_month(self: "VendorTools", category: str | None = None, months: int = 12) -> dict:
+    """Month-by-month buying activity in the categories this vendor supplies, built ONLY from the events this
+    vendor was invited to. That keeps it own-data (no other vendor is involved) while still answering
+    'when do my buyers actually buy' for stocking decisions."""
+    months = max(3, min(int(months), 36))
+    anchor = one(self.c, """SELECT MAX(tr.bid_start_time) AS d FROM trade_requests tr
+                            JOIN audiences a ON a.trade_request_id=tr.id AND a.vendor_company_id=?""", (self.v,))
+    if not anchor or not anchor["d"]:
+        return {"categories": [], "message": "You have not been invited to any events yet, so there is no demand history to show."}
+    cells = rows(self.c, """
+        SELECT strftime('%Y-%m', tr.bid_start_time) AS month, pc.name AS category, p.unit AS unit,
+               COUNT(DISTINCT tr.id) AS events, ROUND(SUM(tp.quantity), 2) AS quantity,
+               COUNT(DISTINCT CASE WHEN EXISTS (SELECT 1 FROM bids b WHERE b.trade_request_id=tr.id
+                                                AND b.vendor_company_id=:v) THEN tr.id END) AS events_you_bid
+        FROM audiences a
+        JOIN trade_requests tr ON tr.id=a.trade_request_id
+        JOIN trade_products tp ON tp.trade_request_id=tr.id
+        JOIN products p ON p.id=tp.product_id
+        JOIN product_categories pc ON pc.id=p.product_category_id
+        WHERE a.vendor_company_id=:v
+          AND tr.bid_start_time >= date(:anchor, 'start of month', '-' || :back || ' months')
+        GROUP BY 1, 2, 3 ORDER BY 1, 2""",
+        {"v": self.v, "anchor": anchor["d"][:10], "back": months - 1})
+    return _shape_demand(cells, anchor["d"][:7], months, category)
+
+
+def _shape_demand(cells: list[dict], to_month: str, months: int, category: str | None) -> dict:
+    by_cat: dict[str, dict] = {}
+    for c in cells:
+        if category and category.lower() not in c["category"].lower():
+            continue
+        e = by_cat.setdefault(c["category"], {"category": c["category"], "units": set(), "events": 0,
+                                              "quantity": 0.0, "events_you_bid": 0, "by_month": {}})
+        e["units"].add(c["unit"])
+        e["events"] += c["events"]
+        e["quantity"] += c["quantity"] or 0.0
+        e["events_you_bid"] += c["events_you_bid"]
+        m = e["by_month"].setdefault(c["month"], {"month": c["month"], "events": 0, "quantity": 0.0, "events_you_bid": 0})
+        m["events"] += c["events"]
+        m["quantity"] += c["quantity"] or 0.0
+        m["events_you_bid"] += c["events_you_bid"]
+
+    out = []
+    for e in sorted(by_cat.values(), key=lambda x: -x["events"]):
+        ms = sorted(e["by_month"].values(), key=lambda m: m["month"])
+        for m in ms:
+            m["quantity"] = round(m["quantity"], 2)
+        peak = max(ms, key=lambda m: (m["quantity"], m["events"])) if ms else None
+        out.append({"category": e["category"], "units": sorted(e["units"]), "events": e["events"],
+                    "total_quantity": round(e["quantity"], 2), "events_you_bid": e["events_you_bid"],
+                    "months_with_demand": len(ms), "months_covered": months,
+                    "avg_events_per_active_month": round(e["events"] / len(ms), 2) if ms else 0,
+                    "peak_month": peak["month"] if peak else None,
+                    "peak_month_quantity": peak["quantity"] if peak else None,
+                    "by_month": ms,
+                    "confidence": "low" if len(ms) < 6 or e["events"] < 8 else "medium"})
+    return {"window_months": months, "through_month": to_month, "categories": out,
+            "scope": "Counts only events you were invited to, in the categories you supply. This is your own demand "
+                     "pipeline, not total market demand.",
+            "note": "Quantities mix units where a category uses more than one; check `units` before stocking to a number. "
+                    "Months with no invitation are absent, not zero-demand."}
+
+
+def _bid_revision_behaviour(self: "VendorTools", limit: int = 15) -> dict:
+    """First bid vs final bid per event, how often this vendor revises, and what revising is worth to them."""
+    evs = rows(self.c, """
+        WITH totals AS (
+            SELECT b.id AS bid_id, b.trade_request_id AS tr, b.created_at, b.bid_tag,
+                   SUM(btp.price * btp.quantity) AS total
+            FROM bids b JOIN bid_trade_products btp ON btp.bid_id = b.id
+            WHERE b.vendor_company_id = :v GROUP BY b.id),
+        seq AS (
+            SELECT *, ROW_NUMBER() OVER (PARTITION BY tr ORDER BY created_at) AS rn,
+                      COUNT(*)     OVER (PARTITION BY tr)                     AS n
+            FROM totals)
+        SELECT f.tr AS trade_request_id, eg.title, pc.name AS category, tr.rfx_mode, tr.closed_at,
+               f.n - 1 AS revisions, ROUND(f.total, 2) AS first_bid_total, ROUND(l.total, 2) AS final_bid_total,
+               ROUND(l.total - f.total, 2) AS delta_amount,
+               CASE WHEN f.total > 0 THEN ROUND((l.total - f.total) / f.total * 100, 2) END AS delta_pct,
+               l.bid_tag AS final_round,
+               CASE WHEN EXISTS (SELECT 1 FROM proposals pr WHERE pr.trade_request_id = f.tr
+                                 AND pr.vendor_company_id = :v AND pr.status = 'selected')
+                    THEN 1 ELSE 0 END AS won
+        FROM seq f
+        JOIN seq l ON l.tr = f.tr AND l.rn = l.n
+        JOIN trade_requests tr ON tr.id = f.tr
+        JOIN event_groups eg ON eg.id = tr.event_group_id
+        LEFT JOIN product_categories pc ON pc.id = (
+            SELECT p.product_category_id FROM trade_products tp JOIN products p ON p.id = tp.product_id
+            WHERE tp.trade_request_id = tr.id LIMIT 1)
+        WHERE f.rn = 1 AND tr.status = 'closed'
+        ORDER BY tr.closed_at DESC""", {"v": self.v})
+    if not evs:
+        return {"events_bid": 0, "message": "You have not placed a bid on any closed event yet, so there is nothing to compare."}
+
+    buckets: dict[int, dict] = {}
+    for e in evs:
+        key = min(e["revisions"], 2)
+        b = buckets.setdefault(key, {"revisions": key, "events": 0, "wins": 0, "_drop": []})
+        b["events"] += 1
+        b["wins"] += e["won"]
+        if e["delta_pct"] is not None:
+            b["_drop"].append(-e["delta_pct"])
+    by_rev = []
+    for b in sorted(buckets.values(), key=lambda x: x["revisions"]):
+        drops = b.pop("_drop")
+        by_rev.append({**b, "win_rate": round(b["wins"] / b["events"], 3),
+                       "avg_price_drop_pct": round(sum(drops) / len(drops), 2) if drops else 0.0,
+                       "label": "quoted once, never revised" if b["revisions"] == 0
+                                else f"revised {b['revisions']}x" + ("+" if b["revisions"] == 2 else "")})
+    revised = [e for e in evs if e["revisions"] > 0]
+    once = next((b for b in by_rev if b["revisions"] == 0), None)
+    more = [b for b in by_rev if b["revisions"] > 0]
+    if once and more:
+        w_more = sum(b["wins"] for b in more) / sum(b["events"] for b in more)
+        lift = round((w_more - once["win_rate"]) * 100, 1)
+        insight = (f"You revised on {round(len(revised) / len(evs) * 100)}% of the events you bid on. "
+                   f"Win rate when you revised: {round(w_more * 100)}%, versus {round(once['win_rate'] * 100)}% when you "
+                   f"quoted once and left — {'+' if lift >= 0 else ''}{lift} points.")
+    elif once:
+        insight = "You have never revised a bid. Every event you bid on, you quoted once and left."
+    else:
+        insight = "You revised on every event you bid on."
+    return {"events_bid": len(evs), "events_revised": len(revised),
+            "revision_rate": round(len(revised) / len(evs), 3),
+            "by_revisions": by_rev, "insight": insight,
+            "events": [dict({k: e[k] for k in ("trade_request_id", "title", "category", "rfx_mode", "closed_at",
+                                               "revisions", "first_bid_total", "final_bid_total", "delta_amount",
+                                               "delta_pct", "final_round")},
+                            outcome="won" if e["won"] else "lost") for e in evs[: int(limit)]],
+            "note": "All figures are your own bids only. A negative delta_pct means your final bid was lower than your first."}
+
+
 VendorTools.t_event_detail = _event_detail
 VendorTools.t_category_summary = _category_summary
 VendorTools.t_compare_periods = _compare_periods
 VendorTools.t_my_buyers = _my_buyers
+VendorTools.t_demand_by_month = _demand_by_month
+VendorTools.t_bid_revision_behaviour = _bid_revision_behaviour
 
 
 def context_summary(tools: VendorTools) -> dict:

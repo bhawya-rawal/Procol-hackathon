@@ -3,6 +3,7 @@ import unittest
 
 from tests.conftest_db import conn, vendor_id
 from vi.chat.service import chat, greeting, history
+from vi.chat.tools import VendorTools
 
 QUESTIONS = [
     "which events did I lose recently?", "why did I lose the last event?", "why did I lose the steel rfq in july?",
@@ -10,6 +11,9 @@ QUESTIONS = [
     "where am I weak technically?", "is my profile complete?", "how am I doing with Apex Steelworks?",
     "how many invitations did I get?", "who won the last event and what was the L1 price?", "tell me the competitor prices",
     "how am I doing overall?", "help",
+    "month-by-month breakdown of buyer demand for each product category to manage my inventory",
+    "first bid vs final bid delta per event and count of revisions",
+    "does revising my bid actually help me win?",
 ]
 
 
@@ -72,6 +76,75 @@ class ChatAnswersFromData(unittest.TestCase):
     def test_greeting_has_totals_and_suggestions(self):
         g = greeting(self.c, vendor_id(self.c, "V-STAR"))
         self.assertIn("won", g["text"]); self.assertGreaterEqual(len(g["suggestions"]), 4)
+
+
+class ChatDemandAndRevisions(unittest.TestCase):
+    """The two aggregate questions the router used to swallow: demand seasonality and bid-revision behaviour."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = conn()
+        cls.v = vendor_id(cls.c, "V-LATE")
+
+    def test_demand_question_routes_to_demand_tool_not_help(self):
+        r = chat(self.c, self.v, None,
+                 "Could you provide a month-by-month breakdown of buyer demand over the past year "
+                 "for each product category to help me manage my inventory?", force_offline=True)
+        self.assertEqual([t["tool"] for t in r["tools"]], ["demand_by_month"])
+        self.assertIn("events by month", r["reply"])
+        self.assertIn("not total market demand", r["reply"])
+
+    def test_revision_question_routes_to_revision_tool_not_price_band(self):
+        r = chat(self.c, self.v, None,
+                 "First bid vs final bid delta per event, count of revisions. Separates vendors who "
+                 "quote once and leave from those who engage in the auction.", force_offline=True)
+        self.assertEqual([t["tool"] for t in r["tools"]], ["bid_revision_behaviour"])
+        self.assertIn("quoted once, never revised", r["reply"])
+        self.assertNotIn("gap to L1", r["reply"])
+
+    def test_demand_tool_only_counts_events_this_vendor_was_invited_to(self):
+        t = VendorTools(self.c, self.v)
+        d = t.call("demand_by_month", {})
+        invited = {r[0] for r in self.c.execute(
+            "SELECT DISTINCT trade_request_id FROM audiences WHERE vendor_company_id=?", (self.v,))}
+        counted = sum(c["events"] for c in d["categories"])
+        self.assertGreater(counted, 0)
+        self.assertLessEqual(counted, len(invited))
+        for c in d["categories"]:
+            self.assertEqual(c["events"], sum(m["events"] for m in c["by_month"]))
+            self.assertLessEqual(c["events_you_bid"], c["events"])
+
+    def test_demand_respects_category_filter_and_month_window(self):
+        t = VendorTools(self.c, self.v)
+        all_cats = t.call("demand_by_month", {})["categories"]
+        if not all_cats:
+            self.skipTest("vendor has no demand history")
+        name = all_cats[0]["category"]
+        one_cat = t.call("demand_by_month", {"category": name})["categories"]
+        self.assertEqual([c["category"] for c in one_cat], [name])
+        short = t.call("demand_by_month", {"months": 3})
+        self.assertEqual(short["window_months"], 3)
+        self.assertLessEqual(sum(c["events"] for c in short["categories"]),
+                             sum(c["events"] for c in all_cats))
+        self.assertEqual(t.call("demand_by_month", {"months": 999})["window_months"], 36)
+
+    def test_revision_buckets_reconcile_with_the_event_list(self):
+        t = VendorTools(self.c, self.v)
+        r = t.call("bid_revision_behaviour", {"limit": 500})
+        self.assertEqual(sum(b["events"] for b in r["by_revisions"]), r["events_bid"])
+        self.assertEqual(sum(b["events"] for b in r["by_revisions"] if b["revisions"] > 0), r["events_revised"])
+        for e in r["events"]:
+            self.assertEqual(e["revisions"] == 0, e["delta_amount"] == 0)
+            if e["revisions"] == 0:
+                self.assertEqual(e["first_bid_total"], e["final_bid_total"])
+
+    def test_revision_lift_is_visible_for_a_vendor_that_revises(self):
+        for v in [r[0] for r in self.c.execute("SELECT id FROM companies WHERE category='vendor'")]:
+            r = VendorTools(self.c, v).call("bid_revision_behaviour", {})
+            if r.get("events_revised"):
+                self.assertIn("revised on", r["insight"])
+                return
+        self.fail("no vendor in the seed revises a bid")
 
 
 class ChatPolicyAndSessions(unittest.TestCase):

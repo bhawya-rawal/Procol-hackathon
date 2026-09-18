@@ -13,7 +13,8 @@ HELP = ("I can answer questions about your own record on this platform. Try:\n"
         "• why did I lose the Steel RFQ in July?\n• which events did I lose recently?\n"
         "• what price should I quote in Steel?\n• how do I do on counter-offers?\n"
         "• how is my delivery performance?\n• where am I weak technically?\n"
-        "• how am I doing with Apex Steelworks?\n• is my profile complete?")
+        "• how am I doing with Apex Steelworks?\n• is my profile complete?\n"
+        "• does revising my bid actually help me win?\n• month-by-month demand by category")
 
 
 def pct(v): return "—" if v is None else f"{round(v * 100)}%"
@@ -39,11 +40,15 @@ class OfflineEngine:
         if cat == "mro": cat = "mro spares"
         if cat == "logistics": cat = "logistics services"
 
-        if re.search(r"\b(help|what can you|options)\b", q):
+        if re.match(r"^\W*(help|what can you|what else can you|options)\b", q):
             return HELP
         if re.search(r"\b(who won|winner|winning vendor|l1 (price|bid|vendor|amount)|lowest (price|bid)|competitor|other vendor|rival)", q):
             return ("I don't have — and will never show — other vendors' prices, names or ranks. What I can tell you is your own "
                     "position: your % gap to the lowest bid and your rank out of the bidders. Ask “why did I lose …” for any event.")
+        if re.search(r"\b(demand|inventory|stock\w*|seasonal\w*|month.by.month|monthly|per month|forecast\w*|pipeline|volumes?)\b", q):
+            return self._demand(cat, q)
+        if re.search(r"\b(revis\w*|re.?bid\w*|first bid|final bid|second bid|counter.?bid|improve\w* my bid|quote once|bid again)\b", q):
+            return self._revisions()
         if re.search(r"\b(lose|lost|losing|didn.?t win|why.*(reject|not selected))\b", q):
             return self._why_lost(q, cat, history)
         if re.search(r"\b(quote|price|pricing|band|how much|competitive|cheaper|expensive|gap)\b", q):
@@ -99,6 +104,44 @@ class OfflineEngine:
         if re.search(r"\b(last|latest|recent|most recent)\b", q) or mon or mode:
             return cands[0]
         return None
+
+    def _demand(self, cat, q: str) -> str:
+        months = 12
+        m = re.search(r"\b(\d{1,2})\s*(?:months?|mo)\b", q)
+        if m:
+            months = int(m.group(1))
+        elif re.search(r"\b(two years|24 months|2 years)\b", q):
+            months = 24
+        d = self._call("demand_by_month", {"category": cat, "months": months})
+        cats = d.get("categories") or []
+        if not cats:
+            return d.get("message") or f"No buying activity on record{' in ' + cat.title() if cat else ''} in the last {months} months."
+        lines = [f"Demand in the events you were invited to, last {d['window_months']} months (through {d['through_month']}):"]
+        for c in cats:
+            months_str = ", ".join(f"{m['month'][5:]} {m['events']}" for m in c["by_month"])
+            unit = "/".join(c["units"])
+            lines.append(f"**{c['category']}** — {c['events']} events, {c['total_quantity']:,.0f} {unit} asked; "
+                         f"you bid on {c['events_you_bid']}. Busiest month {c['peak_month']} "
+                         f"({c['peak_month_quantity']:,.0f} {unit}).")
+            lines.append(f"  events by month — {months_str}")
+            if c["confidence"] == "low":
+                lines.append(f"  (thin history: {c['events']} events over {c['months_with_demand']} active months — treat as a hint, not a forecast)")
+        lines.append(d["scope"])
+        return "\n".join(lines)
+
+    def _revisions(self) -> str:
+        r = self._call("bid_revision_behaviour", {"limit": 5})
+        if not r.get("events_bid"):
+            return r.get("message", "No bids on record yet.")
+        lines = [r["insight"]]
+        for b in r["by_revisions"]:
+            lines.append(f"• {b['label']}: {b['events']} events, won {b['wins']} ({pct(b['win_rate'])})"
+                         + (f", average price cut {b['avg_price_drop_pct']:.1f}%" if b["avg_price_drop_pct"] else ""))
+        lines.append("Recent events (first bid → final bid):")
+        for e in r["events"]:
+            move = "no change" if not e["delta_pct"] else f"{e['delta_pct']:+.1f}%"
+            lines.append(f"• {e['closed_at'][:10]} {e['title']} — {e['revisions']} revision(s), {move}, {e['outcome']}")
+        return "\n".join(lines)
 
     def _price(self, cat) -> str:
         pb = self._call("price_band", {"category": cat})["categories"]

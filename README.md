@@ -98,9 +98,14 @@ memory only; or set `ANTHROPIC_API_KEY` before `./run.sh serve`). The badge turn
 free-form. Without a key a deterministic fallback engine answers a fixed set of questions — it is there so the
 demo never dead-ends, not as the product.
 
-- **Tools, not free access.** Claude can only call twelve scoped functions (`vi/chat/tools.py`): `my_events`,
+- **Tools, not free access.** Claude can only call fourteen scoped functions (`vi/chat/tools.py`): `my_events`,
   `event_detail`, `why_did_i_lose`, `price_band`, `habits`, `delivery`, `technical`, `profile`, `buyer_summary`,
-  `my_buyers`, `category_summary`, `compare_periods`. Each returns guarded data. There is no other path to the DB.
+  `my_buyers`, `category_summary`, `compare_periods`, `demand_by_month`, `bid_revision_behaviour`. Each returns
+  guarded data. There is no other path to the DB.
+- **Aggregates stay own-data.** `demand_by_month` answers seasonality ("when do my buyers buy, what should I
+  stock") from the events *this* vendor was invited to, so it never becomes a market-wide leak; the payload says
+  so explicitly. `bid_revision_behaviour` compares first bid to final bid and reports win rate at 0 / 1 / 2+
+  revisions, which is what separates vendors who quote once and leave from those who work the auction.
 - **Guard twice.** Tool results are guarded before Claude sees them; the final reply is scanned again so a
   paraphrase can never surface another vendor's name. Asking "who won / L1's price" gets a one-line refusal plus
   the relative view.
